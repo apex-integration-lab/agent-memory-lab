@@ -1,0 +1,141 @@
+name: Agent on Issue Assignment
+
+on:
+  issues:
+    types: [assigned]
+
+jobs:
+  route-and-run:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Extract issue context
+        id: issue
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_LABELS: ${{ toJson(github.event.issue.labels.*.name) }}
+          ISSUE_ASSIGNEE: ${{ github.event.issue.assignee.login }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          echo "number=$ISSUE_NUMBER" >> $GITHUB_OUTPUT
+
+          # Determine agent from labels
+          LABELS='${{ toJson(github.event.issue.labels.*.name) }}'
+          AGENT="default"
+          if echo "$LABELS" | grep -q '"memory-agent"'; then
+            AGENT="memory-agent"
+          elif echo "$LABELS" | grep -q '"research-agent"'; then
+            AGENT="research-agent"
+          elif echo "$LABELS" | grep -q '"code-agent"'; then
+            AGENT="code-agent"
+          fi
+          echo "agent=$AGENT" >> $GITHUB_OUTPUT
+          echo "Selected agent: $AGENT"
+
+      - name: Read agent definition
+        id: agent_def
+        run: |
+          AGENT="${{ steps.issue.outputs.agent }}"
+          if [ "$AGENT" != "default" ] && [ -f "agents/${AGENT}.md" ]; then
+            AGENT_DEF=$(cat "agents/${AGENT}.md")
+          else
+            AGENT_DEF="You are a general-purpose assistant. Complete the task described in the issue."
+          fi
+          # Export multiline safely
+          {
+            echo 'content<<EOF_AGENT_DEF'
+            echo "$AGENT_DEF"
+            echo 'EOF_AGENT_DEF'
+          } >> $GITHUB_OUTPUT
+
+      - name: Read L0 memory context
+        id: memory
+        run: |
+          L0=""
+          if [ -f "memory/.abstract.md" ]; then
+            L0=$(cat memory/.abstract.md)
+          fi
+          {
+            echo 'content<<EOF_MEMORY'
+            echo "$L0"
+            echo 'EOF_MEMORY'
+          } >> $GITHUB_OUTPUT
+
+      - name: Invoke Claude via Anthropic API
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          AGENT_DEF='${{ steps.agent_def.outputs.content }}'
+          MEMORY_L0='${{ steps.memory.outputs.content }}'
+          ISSUE_TITLE='${{ github.event.issue.title }}'
+          ISSUE_BODY='${{ github.event.issue.body }}'
+          ISSUE_LABELS='${{ toJson(github.event.issue.labels.*.name) }}'
+          ASSIGNEE='${{ github.event.issue.assignee.login }}'
+
+          SYSTEM_PROMPT="${AGENT_DEF}
+
+--- Memory Context (L0) ---
+${MEMORY_L0}
+
+You are responding to a GitHub issue. Format your response as a GitHub comment in Markdown.
+Include: a ## Result heading, bullet points for what was done, and next steps if applicable."
+
+          USER_PROMPT="Issue: ${ISSUE_TITLE}
+
+Assigned to: @${ASSIGNEE}
+Labels: ${ISSUE_LABELS}
+
+${ISSUE_BODY}"
+
+          # Build JSON payload with jq to handle escaping correctly
+          PAYLOAD=$(jq -n \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg user "$USER_PROMPT" \
+            '{
+              model: "claude-opus-4-5",
+              max_tokens: 2048,
+              system: $system,
+              messages: [{role: "user", content: $user}]
+            }')
+
+          RESPONSE=$(curl -s \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d "$PAYLOAD" \
+            https://api.anthropic.com/v1/messages)
+
+          # Extract text content
+          COMMENT=$(echo "$RESPONSE" | jq -r '.content[0].text // "Agent returned no content. Raw response: " + (. | tostring)')
+          {
+            echo 'text<<EOF_COMMENT'
+            echo "$COMMENT"
+            echo 'EOF_COMMENT'
+          } >> $GITHUB_OUTPUT
+
+      - name: Post comment on issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `${{ steps.claude.outputs.text }}`
+            const agent = `${{ steps.issue.outputs.agent }}`
+            const comment = `> 🤖 **${agent}** responded\n\n${body}`
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.issue.outputs.number }},
+              body: comment
+            })
